@@ -90,6 +90,7 @@ const FILES = {
   welcomeConf:   path.join(DATA_DIR, 'welcome_config.json'),   // message de bienvenue
   zyzzHonors:    path.join(DATA_DIR, 'zyzz_honors.json'),      // titres Zyzz
   starboard:     path.join(DATA_DIR, 'starboard.json'),        // config starboard
+  repData:       path.join(DATA_DIR, 'rep_data.json'),         // système +rep vendeurs
 };
 
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -242,6 +243,11 @@ let starboardData   = loadJSON(FILES.starboard,     {
   posted: {},   // { messageId: starboardMessageId }
 });
 
+// ── SYSTÈME +REP (réputation vendeurs) ──────────────────────────
+// { [vendeurId]: { reps: [ { by, byTag, comment, at } ] } }
+let repData = loadJSON(FILES.repData, {});
+function saveRepData() { saveJSON(FILES.repData, repData); }
+
 function saveVerifConfig()   { saveJSON(FILES.verifConfig,   verifConfig);   }
 function saveBlacklist()     { saveJSON(FILES.blacklist,     blacklistData); }
 function savePendingVerifs() { saveJSON(FILES.pendingVerifs, pendingVerifs); }
@@ -330,11 +336,55 @@ function accountAgeDays(userId) {
 function formatAge(days) {
   if (days < 1)   return '< 1 jour 🚨';
   if (days < 7)   return `${days} jours 🚨`;
-  if (days < 30)  return `${days} jours âš ï¸`;
+  if (days < 30)  return `${days} jours ⚠️`;
   if (days < 365) return `${Math.floor(days / 30)} mois ${days % 30} jours`;
   const years  = Math.floor(days / 365);
   const months = Math.floor((days % 365) / 30);
   return `${years} an${years > 1 ? 's' : ''} ${months > 0 ? months + ' mois' : ''}`;
+}
+
+/**
+ * Normalise un pseudo pour la comparaison (minuscules, sans caractères
+ * spéciaux, sans suffixe numérique) afin de repérer les doubles comptes.
+ */
+function normalizeUsername(name) {
+  return (name || '')
+    .toLowerCase()
+    .normalize('NFKD').replace(/[\u0300-\u036f]/g, '') // retire les accents
+    .replace(/[^a-z0-9]/g, '')
+    .replace(/\d+$/, '');
+}
+
+/**
+ * Recherche dans le cache du serveur d'autres membres qui pourraient être
+ * le même utilisateur (même avatar exact, ou pseudo quasi identique).
+ * Heuristique best-effort (Discord ne donne pas accès aux IP) mais très
+ * efficace pour repérer les avatars réutilisés ou les pseudos clonés.
+ */
+function findPossibleAltAccounts(guild, member) {
+  const matches = [];
+  const targetAvatarHash = member.user.avatar;      // null si avatar par défaut
+  const targetBase       = normalizeUsername(member.user.username);
+
+  guild.members.cache.forEach((m) => {
+    if (m.id === member.id || m.user.bot) return;
+    const reasons = [];
+
+    if (targetAvatarHash && m.user.avatar === targetAvatarHash) {
+      reasons.push('même avatar exact');
+    }
+
+    const base = normalizeUsername(m.user.username);
+    if (targetBase.length >= 3 && base === targetBase) {
+      reasons.push('pseudo quasi identique');
+    }
+
+    if (reasons.length > 0) {
+      matches.push({ id: m.id, tag: m.user.tag, reasons });
+    }
+  });
+
+  return matches.slice(0, 5);
 }
 
 /**
@@ -364,19 +414,25 @@ async function sendVerifRequest(guild, member) {
   // Pour les membres normaux, on peut voir si la guild requiert MFA
   const mfaRequired = guild.mfaLevel === 1;
 
+  // Détection de doubles comptes (avatar identique / pseudo quasi identique)
+  const altMatches = findPossibleAltAccounts(guild, member);
+  const hasAltMatch = altMatches.length > 0;
+
   // Couleur selon suspicion
-  const embedColor = isSuspect ? '#FF0000' : ageDays < 30 ? '#FFA500' : '#00C851';
+  const isReallySuspect = isSuspect || hasAltMatch;
+  const embedColor = isReallySuspect ? '#FF0000' : ageDays < 30 ? '#FFA500' : '#00C851';
 
   const flags = [];
   if (isSuspect) flags.push('🚨 **COMPTE RÉCENT** (< 7 jours)');
-  if (!hasAvatar) flags.push('âš ï¸ Pas d\'avatar (compte par défaut)');
-  if (mfaRequired) flags.push('ℹï¸ Le serveur requiert la A2F');
+  if (!hasAvatar) flags.push('⚠️ Pas d\'avatar (compte par défaut)');
+  if (mfaRequired) flags.push('ℹ️ Le serveur requiert la A2F');
+  if (hasAltMatch) flags.push('👥 **DOUBLE COMPTE POSSIBLE** (voir ci-dessous)');
 
   const flagsStr = flags.length > 0 ? flags.join('\n') : '✅ Aucun signal suspect';
 
   const verifEmbed = new EmbedBuilder()
     .setColor(embedColor)
-    .setTitle(`${isSuspect ? '🚨' : 'ðŸ”'} Demande de vérification`)
+    .setTitle(`${isReallySuspect ? '🚨' : '🔍'} Demande de vérification`)
     .setThumbnail(avatarUrl)
     .addFields(
       {
@@ -399,20 +455,25 @@ async function sendVerifRequest(guild, member) {
         inline: false,
       },
       {
-        name: '🛡ï¸ Signaux de sécurité',
+        name: '🛡️ Signaux de sécurité',
         value: flagsStr,
         inline: false,
       },
       {
         name: '🎭 Avatar',
-        value: hasAvatar ? `[Voir l'avatar](${avatarUrl})` : 'âŒ Avatar par défaut Discord',
+        value: hasAvatar ? `[Voir l'avatar](${avatarUrl})` : '❌ Avatar par défaut Discord',
         inline: true,
       },
       {
         name: '🤖 Bot ?',
-        value: member.user.bot ? '✅ Oui (BOT)' : 'âŒ Non',
+        value: member.user.bot ? '✅ Oui (BOT)' : '❌ Non',
         inline: true,
       },
+      ...(hasAltMatch ? [{
+        name: '👥 Comptes potentiellement liés',
+        value: altMatches.map(m => `<@${m.id}> (\`${m.tag}\`) — ${m.reasons.join(', ')}`).join('\n'),
+        inline: false,
+      }] : []),
     )
     .setFooter({ text: `Demande reçue · ID ${member.id}` })
     .setTimestamp();
@@ -425,7 +486,7 @@ async function sendVerifRequest(guild, member) {
       .setStyle(ButtonStyle.Success),
     new ButtonBuilder()
       .setCustomId(`verif_refuse_${member.id}`)
-      .setLabel('âŒ  Refuser (kick)')
+      .setLabel('❌  Refuser (kick)')
       .setStyle(ButtonStyle.Danger),
     new ButtonBuilder()
       .setCustomId(`verif_blacklist_${member.id}`)
@@ -435,7 +496,7 @@ async function sendVerifRequest(guild, member) {
 
   try {
     const logMsg = await logChannel.send({
-      content: `${isSuspect ? '@here ' : ''}\`[VERIF]\` Nouveau membre en attente de vérification`,
+      content: `${isReallySuspect ? '@here ' : ''}\`[VERIF]\` Nouveau membre en attente de vérification`,
       embeds: [verifEmbed],
       components: [row],
     });
@@ -470,7 +531,7 @@ async function disableVerifButtons(guild, userId, status) {
     if (!msg) return;
 
     const statusColors  = { approved: ButtonStyle.Success, refused: ButtonStyle.Secondary, blacklisted: ButtonStyle.Secondary };
-    const statusLabels  = { approved: '✅ Approuvé', refused: 'âŒ Refusé', blacklisted: '🚫 Blacklisté' };
+    const statusLabels  = { approved: '✅ Approuvé', refused: '❌ Refusé', blacklisted: '🚫 Blacklisté' };
 
     const disabledRow = new ActionRowBuilder().addComponents(
       new ButtonBuilder()
@@ -665,6 +726,12 @@ const commands = {
             '`!starboard-disable` 🔒 · Désactive le starboard',
             '> Quand un message atteint le seuil de réactions, il est automatiquement posté dans le salon configuré',
           ].join('\n'), inline: false },
+        { name: '🛒 Réputation vendeurs (+REP)', value: [
+            '`+rep @vendeur <commentaire>` · Note un vendeur après une transaction',
+            '`+infos @vendeur` · Fiche complète d\'un vendeur (total, historique, dernier +REP)',
+            '`!rep-reset @user` 🔒 · Réinitialise les +REP d\'un utilisateur',
+            '> Un vendeur ne peut pas se +REP lui-même.',
+          ].join('\n'), inline: false },
       )
       .setFooter({ text: '!aide2 → Rating ELO · !aide3 → Tournoi · !aide4 → Modération · !aide5 → Tickets, RR & Vérif' })
       .setTimestamp();
@@ -673,7 +740,7 @@ const commands = {
     const p2 = new EmbedBuilder()
       .setColor('#FFD700')
       .setAuthor({ name: '⚡ CrousBot — Centre de commandes', iconURL: guildIcon })
-      .setTitle('ðŸ† Rating Gymgirl — Système ELO')
+      .setTitle('🏆 Rating Gymgirl — Système ELO')
       .setDescription(
         '> Préfixe : **`!`**  ·  🔒 = admin  ·  🎭 = rôle Rating requis\n' +
         '> ───────────────────────────────────────────────────'
@@ -690,7 +757,7 @@ const commands = {
             '`!rate-reset <nom>` · Réinitialiser l\'ELO à 1000',
             '`!give-rating @user` · Donner / retirer le rôle Rating',
           ].join('\n'), inline: false },
-        { name: '⚙ï¸ Fonctionnement', value: [
+        { name: '⚙️ Fonctionnement', value: [
             '• Chaque duel met à jour les scores ELO en temps réel **(K=32)**',
             '• Les votes durent **5 minutes** puis expirent automatiquement',
             '• Plusieurs membres peuvent voter sur le même duel',
@@ -705,7 +772,7 @@ const commands = {
     const p3 = new EmbedBuilder()
       .setColor('#F39C12')
       .setAuthor({ name: '⚡ CrousBot — Centre de commandes', iconURL: guildIcon })
-      .setTitle('⚔ï¸ Tournoi Physique — Élimination directe')
+      .setTitle('⚔️ Tournoi Physique — Élimination directe')
       .setDescription(
         '> Préfixe : **`!`**  ·  🔒 = admin uniquement\n' +
         '> ───────────────────────────────────────────────────'
@@ -716,11 +783,11 @@ const commands = {
             '`!tournoi-status` · État du tournoi (round, matchs, qualifiés)',
             '`!tournoi-cancel` · Annule le tournoi en cours',
           ].join('\n'), inline: false },
-        { name: '⚙ï¸ Fonctionnement', value: [
+        { name: '⚙️ Fonctionnement', value: [
             '**1.** Scan du salon photos (jusqu\'à 1000 messages)',
             '**2.** 1 seule photo retenue par personne (première trouvée)',
             '**3.** Matchs générés aléatoirement par paires',
-            '**4.** Vote via boutons **ðŸ† Joueur A / ðŸ† Joueur B**',
+            '**4.** Vote via boutons **🏆 Joueur A / 🏆 Joueur B**',
             '**5.** Le gagnant avance — élimination directe',
             '**6.** Nombre impair → bye automatique (passage sans match)',
           ].join('\n'), inline: false },
@@ -738,7 +805,7 @@ const commands = {
         '> ───────────────────────────────────────────────────'
       )
       .addFields(
-        { name: 'âš ï¸ Warns', value: [
+        { name: '⚠️ Warns', value: [
             '`!warn @user [raison]` · Avertit — jail auto au **3ème** warn',
             '`!warns @user` · Historique des warns d\'un membre',
             '`!clearwarns @user` · Supprime tous les warns',
@@ -754,7 +821,7 @@ const commands = {
             '`!source` · Auto-mute 10 min (règle 1 — sourceur détecté)',
             '`!mk677` · Auto-mute 10 min (règle 1 — mk677 mentionné)',
           ].join('\n'), inline: false },
-        { name: '🛡ï¸ Anti-Badwords', value: [
+        { name: '🛡️ Anti-Badwords', value: [
             '`!badwords-add <mot>` · Ajoute un mot interdit (suppression + warn auto)',
             '`!badwords-remove <mot>` · Retire un mot de la liste',
             '`!badwords-list` · Affiche tous les mots interdits',
@@ -809,10 +876,10 @@ const commands = {
             '`!blacklist-list` 🔒 · Affiche toute la blacklist',
             '`!pending-list` 🔒 · Liste les vérifications en attente',
           ].join('\n'), inline: false },
-        { name: '⚙ï¸ Sécurité automatique', value: [
+        { name: '⚙️ Sécurité automatique', value: [
             '• Comptes blacklistés → rejetés automatiquement à la réaction',
             '• Comptes **< 7 jours** → signalés en rouge 🚨',
-            '• Comptes **< 30 jours** → signalés en orange âš ï¸',
+            '• Comptes **< 30 jours** → signalés en orange ⚠️',
             '• Sans avatar → signalé automatiquement',
           ].join('\n'), inline: false },
       )
@@ -848,7 +915,7 @@ const commands = {
       } catch {}
       return message.reply({ embeds: [new EmbedBuilder()
         .setColor('#95A5A6')
-        .setTitle('â˜ ï¸ Titre retiré — Fils de Zyzz')
+        .setTitle('☠️ Titre retiré — Fils de Zyzz')
         .setDescription(`<@${target.id}> n'est plus un **Fils de Zyzz**.\nLe soleil s'est couché sur son physique.`)
         .addFields(
           { name: 'Titre accordé le', value: new Date(honor.at).toLocaleDateString('fr-FR'), inline: true },
@@ -872,7 +939,7 @@ const commands = {
         `*"We're all gonna make it, brah."*`
       )
       .addFields(
-        { name: 'ðŸ… Titre',        value: '⚡ Fils de Zyzz',             inline: true },
+        { name: '🏅 Titre',        value: '⚡ Fils de Zyzz',             inline: true },
         { name: '👑 Accordé par',  value: `<@${message.author.id}>`,     inline: true },
       )
       .setThumbnail(target.user.displayAvatarURL({ size: 256 }))
@@ -950,22 +1017,22 @@ const commands = {
 
     const confirmMsg = await message.reply({ embeds: [new EmbedBuilder()
       .setColor('#FFA500')
-      .setTitle('âš ï¸ Confirmation requise')
+      .setTitle('⚠️ Confirmation requise')
       .setDescription(
         `Tu es sur le point d'envoyer un DM à **tous les membres** avec le rôle <@&${role.id}>.\n\n**Aperçu du message :**\n> ${texte.slice(0, 400)}`
       )
-      .setFooter({ text: 'Réagis ✅ pour confirmer ou âŒ pour annuler — 30 secondes' })] });
+      .setFooter({ text: 'Réagis ✅ pour confirmer ou ❌ pour annuler — 30 secondes' })] });
 
     await confirmMsg.react('✅').catch(() => {});
-    await confirmMsg.react('âŒ').catch(() => {});
+    await confirmMsg.react('❌').catch(() => {});
 
     const collected = await confirmMsg.awaitReactions({
-      filter: (r, u) => ['✅', 'âŒ'].includes(r.emoji.name) && u.id === message.author.id,
+      filter: (r, u) => ['✅', '❌'].includes(r.emoji.name) && u.id === message.author.id,
       max: 1, time: 30000,
     }).catch(() => null);
 
-    if (!collected || collected.size === 0 || collected.first().emoji.name === 'âŒ') {
-      return confirmMsg.edit({ embeds: [new EmbedBuilder().setColor('#95A5A6').setTitle('âŒ Annonce DM annulée')] });
+    if (!collected || collected.size === 0 || collected.first().emoji.name === '❌') {
+      return confirmMsg.edit({ embeds: [new EmbedBuilder().setColor('#95A5A6').setTitle('❌ Annonce DM annulée')] });
     }
 
     await confirmMsg.edit({ embeds: [new EmbedBuilder().setColor('#5865F2').setTitle('📨 Envoi des DMs en cours...')] });
@@ -996,7 +1063,7 @@ const commands = {
       .setDescription(`DMs envoyés aux membres avec le rôle <@&${role.id}>.`)
       .addFields(
         { name: '✅ Envoyés', value: `${sent}`,        inline: true },
-        { name: 'âŒ Échecs',  value: `${failed}`,       inline: true },
+        { name: '❌ Échecs',  value: `${failed}`,       inline: true },
         { name: 'Total',      value: `${targets.size}`, inline: true },
       )
       .setFooter({ text: 'Les DMs fermés comptent comme échecs.' })
@@ -1739,7 +1806,7 @@ const commands = {
     if (!message.member.permissions.has(PermissionsBitField.Flags.BanMembers)) return message.reply('Tu n\'as pas la permission de bannir des membres.');
     const target = message.mentions.members.first();
     if (!target) return message.reply('Mentionne un utilisateur a bannir : `!ban @user [raison]`');
-    if (target.id === '535857300552810526') return message.reply('âŒ Cet utilisateur ne peut pas être banni.');
+    if (target.id === '535857300552810526') return message.reply('❌ Cet utilisateur ne peut pas être banni.');
     if (!target.bannable) return message.reply('Je ne peux pas bannir cet utilisateur.');
     const reason = args.slice(1).join(' ') || 'Aucune raison fournie';
     try {
@@ -1830,7 +1897,7 @@ const commands = {
       return message.reply({
         embeds: [new EmbedBuilder()
           .setColor('#00C851')
-          .setTitle('⚙ï¸ Configuration Vérification — Assistant')
+          .setTitle('⚙️ Configuration Vérification — Assistant')
           .setDescription(
             'Pour configurer le système, utilise :\n' +
             '```\n!verif-setup @role-pending | @role-approuvé | #channel-verif | #channel-log-admin\n```\n\n' +
@@ -1844,7 +1911,7 @@ const commands = {
             `• Rôle approuvé : ${verifConfig.approvedRoleId ? `<@&${verifConfig.approvedRoleId}>` : '`non défini`'}\n` +
             `• Channel vérif : ${verifConfig.verifChannelId ? `<#${verifConfig.verifChannelId}>` : '`non défini`'}\n` +
             `• Channel log : ${verifConfig.logChannelId    ? `<#${verifConfig.logChannelId}>`   : '`non défini`'}\n` +
-            `• Statut : ${verifConfig.enabled ? '✅ **ACTIVÉ**' : 'âŒ **DÉSACTIVÉ**'}`
+            `• Statut : ${verifConfig.enabled ? '✅ **ACTIVÉ**' : '❌ **DÉSACTIVÉ**'}`
           )
           .setFooter({ text: 'Après configuration, utilise !verif-enable pour activer' })],
       });
@@ -1879,7 +1946,7 @@ const commands = {
           { name: '\u200b',         value: '\u200b',                             inline: true },
         )
         .setDescription(
-          'âš ï¸ **Pense aussi à :**\n' +
+          '⚠️ **Pense aussi à :**\n' +
           `1. Mettre à jour \`CONFIG.REACTION_ROLE.ROLE_ID\` avec l'ID du rôle pending : \`${verifConfig.pendingRoleId}\`\n` +
           '2. Utiliser `!verif-enable` pour activer le système\n' +
           '3. Configurer les permissions du channel vérif pour que seul le rôle pending puisse le voir'
@@ -1895,7 +1962,7 @@ const commands = {
     await message.reply({
       embeds: [new EmbedBuilder()
         .setColor(verifConfig.enabled ? '#00C851' : '#FF4444')
-        .setTitle(`ðŸ” Config Vérification — ${verifConfig.enabled ? '✅ ACTIVÉ' : 'âŒ DÉSACTIVÉ'}`)
+        .setTitle(`🔍 Config Vérification — ${verifConfig.enabled ? '✅ ACTIVÉ' : '❌ DÉSACTIVÉ'}`)
         .addFields(
           { name: 'Rôle pending',         value: verifConfig.pendingRoleId  ? `<@&${verifConfig.pendingRoleId}>`  : '`non défini`', inline: true },
           { name: 'Rôle approuvé',        value: verifConfig.approvedRoleId ? `<@&${verifConfig.approvedRoleId}>` : '`non défini`', inline: true },
@@ -1903,7 +1970,7 @@ const commands = {
           { name: 'Channel vérif',        value: verifConfig.verifChannelId ? `<#${verifConfig.verifChannelId}>` : '`non défini`', inline: true },
           { name: 'Channel log admin',    value: verifConfig.logChannelId   ? `<#${verifConfig.logChannelId}>`   : '`non défini`', inline: true },
           { name: '\u200b',               value: '\u200b', inline: true },
-          { name: 'â³ En attente',        value: `${pendingCount} membre(s)`, inline: true },
+          { name: '⏳ En attente',        value: `${pendingCount} membre(s)`, inline: true },
           { name: '🚫 Blacklistés',       value: `${blCount} entrée(s)`,      inline: true },
         )
         .setFooter({ text: '!verif-enable / !verif-disable · !verif-setup pour reconfigurer' })],
@@ -1913,7 +1980,7 @@ const commands = {
   '!verif-enable': async (message) => {
     if (!isAdmin(message.author.id)) return message.reply('Permission refusée.');
     if (!verifConfig.pendingRoleId || !verifConfig.approvedRoleId || !verifConfig.logChannelId) {
-      return message.reply('âŒ Configure d\'abord le système avec `!verif-setup` avant de l\'activer.');
+      return message.reply('❌ Configure d\'abord le système avec `!verif-setup` avant de l\'activer.');
     }
     verifConfig.enabled = true; saveVerifConfig();
     await message.reply('✅ Système de vérification **activé**. Les nouvelles réactions déclencheront le flux de vérification manuelle.');
@@ -1922,7 +1989,7 @@ const commands = {
   '!verif-disable': async (message) => {
     if (!isAdmin(message.author.id)) return message.reply('Permission refusée.');
     verifConfig.enabled = false; saveVerifConfig();
-    await message.reply('âŒ Système de vérification **désactivé**. Le comportement par défaut (rôle direct) est restauré.');
+    await message.reply('❌ Système de vérification **désactivé**. Le comportement par défaut (rôle direct) est restauré.');
   },
 
   // ── WHITELIST / BLACKLIST ─────────────────────────────────────
@@ -2079,9 +2146,31 @@ const commands = {
     await message.reply({
       embeds: [new EmbedBuilder()
         .setColor('#FFA500')
-        .setTitle(`â³ Vérifications en attente — ${entries.length}`)
+        .setTitle(`⏳ Vérifications en attente — ${entries.length}`)
         .addFields(fields)
         .setFooter({ text: 'Utilise les boutons dans le channel log pour traiter chaque demande' })],
+    });
+  },
+
+  // ============================================================
+  //  SYSTÈME +REP — ADMINISTRATION
+  // ============================================================
+
+  '!rep-reset': async (message) => {
+    if (!isAdmin(message.author.id)) return message.reply('Permission refusée.');
+    const target = message.mentions.users.first();
+    if (!target) return message.reply('Mentionne un utilisateur : `!rep-reset @user`');
+
+    const had = repData[target.id]?.reps.length || 0;
+    delete repData[target.id];
+    saveRepData();
+
+    await message.reply({
+      embeds: [new EmbedBuilder()
+        .setColor('#FFA500')
+        .setTitle('🔄 +REP réinitialisés')
+        .setDescription(`Les **${had}** +REP de <@${target.id}> ont été supprimés.`)
+        .addFields({ name: 'Par', value: `<@${message.author.id}>`, inline: true })],
     });
   },
 
@@ -2113,15 +2202,15 @@ const commands = {
     const row = new ActionRowBuilder().addComponents(
       new ButtonBuilder()
         .setCustomId(`rate_${voteId}_A`)
-        .setLabel('⬅ï¸  Elle')
+        .setLabel('⬅️  Elle')
         .setStyle(ButtonStyle.Primary),
       new ButtonBuilder()
         .setCustomId(`rate_${voteId}_skip`)
-        .setLabel('â­ï¸  Skip')
+        .setLabel('⏭️  Skip')
         .setStyle(ButtonStyle.Secondary),
       new ButtonBuilder()
         .setCustomId(`rate_${voteId}_B`)
-        .setLabel('Elle  ➡ï¸')
+        .setLabel('Elle  ➡️')
         .setStyle(ButtonStyle.Danger),
     );
 
@@ -2138,11 +2227,11 @@ const commands = {
 
     await message.channel.send({ embeds: [headerEmbed] });
 
-    await message.channel.send({ content: `⬅ï¸  **${girlA.name}**`, files: [girlA.imageUrl] })
-      .catch(() => message.channel.send({ content: `⬅ï¸  **${girlA.name}** — ${girlA.imageUrl}` }));
+    await message.channel.send({ content: `⬅️  **${girlA.name}**`, files: [girlA.imageUrl] })
+      .catch(() => message.channel.send({ content: `⬅️  **${girlA.name}** — ${girlA.imageUrl}` }));
 
-    await message.channel.send({ content: `➡ï¸  **${girlB.name}**`, files: [girlB.imageUrl] })
-      .catch(() => message.channel.send({ content: `➡ï¸  **${girlB.name}** — ${girlB.imageUrl}` }));
+    await message.channel.send({ content: `➡️  **${girlB.name}**`, files: [girlB.imageUrl] })
+      .catch(() => message.channel.send({ content: `➡️  **${girlB.name}** — ${girlB.imageUrl}` }));
 
     const voteMsg = await message.channel.send({ components: [row] });
 
@@ -2168,15 +2257,15 @@ const commands = {
         const msg = await message.channel.messages.fetch(voteMsg.id).catch(() => null);
         if (msg) {
           const expiredRow = new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId('rate_expired_A').setLabel('⬅ï¸ Elle').setStyle(ButtonStyle.Secondary).setDisabled(true),
-            new ButtonBuilder().setCustomId('rate_expired_skip').setLabel('â­ï¸ Skip').setStyle(ButtonStyle.Secondary).setDisabled(true),
-            new ButtonBuilder().setCustomId('rate_expired_B').setLabel('Elle ➡ï¸').setStyle(ButtonStyle.Secondary).setDisabled(true),
+            new ButtonBuilder().setCustomId('rate_expired_A').setLabel('⬅️ Elle').setStyle(ButtonStyle.Secondary).setDisabled(true),
+            new ButtonBuilder().setCustomId('rate_expired_skip').setLabel('⏭️ Skip').setStyle(ButtonStyle.Secondary).setDisabled(true),
+            new ButtonBuilder().setCustomId('rate_expired_B').setLabel('Elle ➡️').setStyle(ButtonStyle.Secondary).setDisabled(true),
           );
           await msg.edit({ components: [expiredRow] }).catch(() => {});
         }
 
         await message.channel.send({
-          embeds: [new EmbedBuilder().setColor('#888888').setTitle('â±ï¸ Vote expiré')
+          embeds: [new EmbedBuilder().setColor('#888888').setTitle('⏱️ Vote expiré')
             .setDescription(`Le duel **${girlA.name}** vs **${girlB.name}** a expiré sans vainqueur.`)],
         }).catch(() => {});
       } catch (err) { console.error('[RATE] Erreur expiration :', err.message); }
@@ -2204,7 +2293,7 @@ const commands = {
     await message.reply({
       embeds: [new EmbedBuilder()
         .setColor('#FFD700')
-        .setTitle('ðŸ† Classement Gymgirl — Top 10')
+        .setTitle('🏆 Classement Gymgirl — Top 10')
         .addFields(fields)
         .setFooter({ text: `${girls.length} athlète(s) dans la base · Système ELO (K=32)` })
         .setTimestamp()],
@@ -2393,7 +2482,7 @@ const commands = {
       .addFields(
         { name: '👤 Identité',       value: `${target.user.tag}\nID : \`${userId}\``,             inline: true  },
         { name: '📅 Arrivée',        value: `Serveur : ${joinedTs}\nCompte : ${createdTs}`,        inline: true  },
-        { name: 'âš ï¸ Warns',          value: `**${warns}/3**`,                                      inline: true  },
+        { name: '⚠️ Warns',          value: `**${warns}/3**`,                                      inline: true  },
         { name: '🚨 Statut actuel',  value: statusFlags.join('\n'),                                inline: true  },
         { name: `🎭 Rôles (${target.roles.cache.size - 1})`, value: roles.slice(0, 1024),          inline: false },
       )
@@ -2408,7 +2497,7 @@ const commands = {
     const [question, ...options] = parts;
     if (options.length > 4) return message.reply('Maximum 4 options.');
 
-    const emojis = ['1ï¸⃣', '2ï¸⃣', '3ï¸⃣', '4ï¸⃣'];
+    const emojis = ['1️⃣', '2️⃣', '3️⃣', '4️⃣'];
     const votes = options.map(() => 0);
     const voters = {};
 
@@ -2502,7 +2591,7 @@ const commands = {
       .setTitle(`Import en masse — ${type === 'cope' ? 'COPE' : 'Intéressants'}`)
       .addFields(
         { name: '✅ Ajoutés',  value: `${added} élément(s)`,                                      inline: true },
-        { name: 'â­ï¸ Ignorés', value: `${skipped.length} (déjà présents)`,                         inline: true },
+        { name: '⏭️ Ignorés', value: `${skipped.length} (déjà présents)`,                         inline: true },
         { name: 'Total liste', value: `${list.length} élément(s)`,                                 inline: true },
         { name: 'Éléments ajoutés', value: items.filter(i => !skipped.includes(i)).map(i => `• ${i}`).join('\n').slice(0, 1024) || '*Aucun*', inline: false },
       )
@@ -2751,7 +2840,7 @@ const commands = {
           .addFields(
             { name: 'Rôle ciblé',   value: `<@&${TARGET_ROLE_ID}>`,        inline: true },
             { name: '✅ Succès',     value: `${success} membre(s)`,          inline: true },
-            { name: 'âŒ Échecs',     value: `${failed} membre(s)`,           inline: true },
+            { name: '❌ Échecs',     value: `${failed} membre(s)`,           inline: true },
             { name: 'Exécuté par',  value: `<@${message.author.id}>`,       inline: true },
           )
           .setFooter({ text: 'Le rôle a été retiré de tous les membres accessibles' })
@@ -2764,7 +2853,7 @@ const commands = {
         { name: 'Échecs',       value: `${failed}`,                   inline: true },
       ], 'Clearrole', '#FFA500');
     } catch (err) {
-      await statusMsg.edit(`âŒ Erreur : ${err.message}`);
+      await statusMsg.edit(`❌ Erreur : ${err.message}`);
     }
   },
 };
@@ -2852,7 +2941,7 @@ client.on('interactionCreate', async (interaction) => {
   if (customId.startsWith('verif_')) {
     // Seuls les admins peuvent interagir
     if (!isAdmin(interaction.user.id)) {
-      return interaction.reply({ content: 'âŒ Seuls les admins peuvent traiter les vérifications.', ephemeral: true });
+      return interaction.reply({ content: '❌ Seuls les admins peuvent traiter les vérifications.', ephemeral: true });
     }
 
     const parts  = customId.split('_');
@@ -2870,17 +2959,17 @@ client.on('interactionCreate', async (interaction) => {
       // Membre parti — nettoyer quand même
       delete pendingVerifs[userId]; savePendingVerifs();
       await disableVerifButtons(interaction.guild, userId, 'refused');
-      return interaction.reply({ content: 'âŒ Le membre a quitté le serveur. Demande nettoyée.', ephemeral: true });
+      return interaction.reply({ content: '❌ Le membre a quitté le serveur. Demande nettoyée.', ephemeral: true });
     }
 
     // ── APPROUVER ──
     if (action === 'approve') {
       if (!verifConfig.approvedRoleId) {
-        return interaction.reply({ content: 'âŒ Rôle approuvé non configuré.', ephemeral: true });
+        return interaction.reply({ content: '❌ Rôle approuvé non configuré.', ephemeral: true });
       }
       const approvedRole = interaction.guild.roles.cache.get(verifConfig.approvedRoleId);
       if (!approvedRole) {
-        return interaction.reply({ content: `âŒ Rôle approuvé introuvable (ID: ${verifConfig.approvedRoleId}).`, ephemeral: true });
+        return interaction.reply({ content: `❌ Rôle approuvé introuvable (ID: ${verifConfig.approvedRoleId}).`, ephemeral: true });
       }
 
       try {
@@ -2945,7 +3034,7 @@ client.on('interactionCreate', async (interaction) => {
               content: `<@${userId}>`,
               embeds: [new EmbedBuilder()
                 .setColor('#FF4444')
-                .setTitle('âŒ Vérification refusée')
+                .setTitle('❌ Vérification refusée')
                 .setDescription('Ta demande d\'accès a été refusée par le staff. Tu vas être retiré du serveur.')],
             }).catch(() => {});
           }
@@ -2960,7 +3049,7 @@ client.on('interactionCreate', async (interaction) => {
         await interaction.reply({
           embeds: [new EmbedBuilder()
             .setColor('#FF4444')
-            .setTitle('âŒ Refusé & kické')
+            .setTitle('❌ Refusé & kické')
             .setDescription(`<@${userId}> a été refusé et kické par <@${interaction.user.id}>.`)],
           ephemeral: true,
         });
@@ -2970,7 +3059,7 @@ client.on('interactionCreate', async (interaction) => {
           embeds: [interaction.message.embeds[0].toJSON()
             ? new EmbedBuilder(interaction.message.embeds[0].toJSON())
                 .setColor('#FF4444')
-                .setTitle(`âŒ REFUSÉ — ${interaction.message.embeds[0].title?.replace(/^[^\s]+\s/, '') || 'Demande de vérification'}`)
+                .setTitle(`❌ REFUSÉ — ${interaction.message.embeds[0].title?.replace(/^[^\s]+\s/, '') || 'Demande de vérification'}`)
                 .setFooter({ text: `Refusé par ${interaction.user.tag} · ${new Date().toLocaleString('fr-FR')}` })
             : interaction.message.embeds[0]],
         }).catch(() => {});
@@ -3056,7 +3145,7 @@ client.on('interactionCreate', async (interaction) => {
     if (choice === 'skip') {
       active.votedUsers.push(interaction.user.id);
       await saveGymgirls(db);
-      return interaction.reply({ content: 'â­ï¸ Skip enregistré.', ephemeral: true });
+      return interaction.reply({ content: '⏭️ Skip enregistré.', ephemeral: true });
     }
 
     const girlA   = (db.girls || []).find(g => g.id === active.girlAId);
@@ -3145,7 +3234,7 @@ client.on('messageCreate', async (message) => {
 
   // ── LIKE AUTO ───────────────────────────────────────────────
   if (likeEnabled && message.author.id === LIKE_TARGET_USER_ID) {
-    try { await message.react('â¤ï¸'); } catch (err) { console.warn('[LIKE AUTO] Impossible de réagir :', err.message); }
+    try { await message.react('❤️'); } catch (err) { console.warn('[LIKE AUTO] Impossible de réagir :', err.message); }
   }
 
   // ── ANTI-BADWORDS ────────────────────────────────────────────
@@ -3166,6 +3255,90 @@ client.on('messageCreate', async (message) => {
       if (bwMsg) setTimeout(() => bwMsg.delete().catch(() => {}), 8000);
       return;
     }
+  }
+
+  // ── SYSTÈME +REP (réputation vendeurs) ────────────────────────
+  const trimmedContent = message.content.trim();
+  const lowerFirstWord = trimmedContent.split(/\s+/)[0]?.toLowerCase();
+
+  if (lowerFirstWord === '+rep') {
+    const target = message.mentions.users.first();
+    if (!target) {
+      return message.reply('Mentionne le vendeur à noter : `+rep @vendeur ton commentaire`');
+    }
+    if (target.bot) {
+      return message.reply('Impossible de +rep un bot.');
+    }
+    if (target.id === message.author.id) {
+      return message.reply('❌ Tu ne peux pas te +rep toi-même.');
+    }
+
+    // Extrait le commentaire (tout ce qui suit la mention)
+    const comment = trimmedContent
+      .replace(/^\+rep/i, '')
+      .replace(/<@!?(\d+)>/, '')
+      .trim();
+
+    if (!repData[target.id]) repData[target.id] = { reps: [] };
+    repData[target.id].reps.push({
+      by:      message.author.id,
+      byTag:   message.author.tag,
+      comment: comment || '*Aucun commentaire*',
+      at:      new Date().toISOString(),
+    });
+    saveRepData();
+
+    const total = repData[target.id].reps.length;
+
+    await message.reply({
+      embeds: [new EmbedBuilder()
+        .setColor('#00C851')
+        .setTitle('⭐ Nouveau +REP')
+        .setThumbnail(target.displayAvatarURL({ size: 128 }))
+        .setDescription(`<@${message.author.id}> a laissé un +REP à <@${target.id}>`)
+        .addFields(
+          { name: 'Commentaire', value: comment || '*Aucun commentaire*', inline: false },
+          { name: 'Total +REP',  value: `${total}`,                       inline: true },
+        )
+        .setFooter({ text: `Utilise +infos @${target.username} pour voir sa fiche complète` })],
+    });
+    return;
+  }
+
+  if (lowerFirstWord === '+infos') {
+    const target = message.mentions.users.first() || message.author;
+    const entry  = repData[target.id];
+    const reps   = entry?.reps || [];
+
+    const total      = reps.length;
+    const uniqueGivers = [...new Set(reps.map(r => r.by))];
+    const giversStr  = uniqueGivers.length > 0
+      ? uniqueGivers.slice(0, 15).map(id => `<@${id}>`).join(', ') + (uniqueGivers.length > 15 ? `, +${uniqueGivers.length - 15} autre(s)` : '')
+      : '*Aucun +REP pour le moment*';
+
+    const lastRep    = reps.length > 0 ? reps[reps.length - 1] : null;
+    const lastRepStr = lastRep
+      ? `<t:${Math.floor(new Date(lastRep.at).getTime() / 1000)}:R> par <@${lastRep.by}>`
+      : '*Aucun*';
+
+    let member = null;
+    try { member = await message.guild.members.fetch(target.id); } catch { /* membre parti */ }
+
+    await message.reply({
+      embeds: [new EmbedBuilder()
+        .setColor('#5865F2')
+        .setTitle(`📋 Fiche vendeur — ${target.tag}`)
+        .setThumbnail(target.displayAvatarURL({ size: 256 }))
+        .addFields(
+          { name: '👤 Pseudo',        value: member?.nickname ? `${target.tag} (\`${member.nickname}\`)` : target.tag, inline: false },
+          { name: '⭐ Total +REP',     value: `${total}`,      inline: true },
+          { name: '🕒 Dernier +REP',  value: lastRepStr,       inline: true },
+          { name: '👥 Qui l\'a +REP', value: giversStr,        inline: false },
+        )
+        .setFooter({ text: `ID : ${target.id}` })
+        .setTimestamp()],
+    });
+    return;
   }
 
   if (!message.content.startsWith(CONFIG.PREFIX)) return;
@@ -3258,7 +3431,7 @@ client.on('messageReactionAdd', async (reaction, user) => {
               content: `<@${user.id}>`,
               embeds: [new EmbedBuilder()
                 .setColor('#FFA500')
-                .setTitle('â³ Vérification en cours')
+                .setTitle('⏳ Vérification en cours')
                 .setDescription(
                   'Bienvenue ! Tu es actuellement en attente de vérification par le staff.\n\n' +
                   '> Un admin va examiner ton profil et te donner accès au serveur.\n' +
