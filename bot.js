@@ -20,6 +20,7 @@ const CONFIG = {
   TIKTOK_USERNAME: 'crousgainz',
   LIVE_CHANNEL_ID: '1473454771305185361',
   LIVE_CHECK_INTERVAL: 2 * 60 * 1000,
+  VIDEO_CHECK_INTERVAL: 5 * 60 * 1000, // fréquence de vérification des nouvelles vidéos TikTok
   PREFIX: '!',
 
   MOMMY_ASMR_USER_IDS: ['1469795368580677717', '535857300552810526', '1475499606304358463'],
@@ -91,6 +92,7 @@ const FILES = {
   zyzzHonors:    path.join(DATA_DIR, 'zyzz_honors.json'),      // titres Zyzz
   starboard:     path.join(DATA_DIR, 'starboard.json'),        // config starboard
   repData:       path.join(DATA_DIR, 'rep_data.json'),         // système +rep vendeurs
+  videoWatch:    path.join(DATA_DIR, 'video_watch.json'),      // surveillance nouvelles vidéos TikTok
 };
 
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -248,6 +250,15 @@ let starboardData   = loadJSON(FILES.starboard,     {
 let repData = loadJSON(FILES.repData, {});
 function saveRepData() { saveJSON(FILES.repData, repData); }
 
+// ── SURVEILLANCE NOUVELLES VIDÉOS TIKTOK ────────────────────────
+let videoWatch = loadJSON(FILES.videoWatch, {
+  username:        null,   // pseudo TikTok (sans @) à surveiller
+  discordChannelId: null,  // salon Discord où poster les nouvelles vidéos
+  lastVideoId:     null,   // ID de la dernière vidéo connue (évite les doublons)
+  enabled:         false,
+});
+function saveVideoWatch() { saveJSON(FILES.videoWatch, videoWatch); }
+
 function saveVerifConfig()   { saveJSON(FILES.verifConfig,   verifConfig);   }
 function saveBlacklist()     { saveJSON(FILES.blacklist,     blacklistData); }
 function savePendingVerifs() { saveJSON(FILES.pendingVerifs, pendingVerifs); }
@@ -341,6 +352,50 @@ function formatAge(days) {
   const years  = Math.floor(days / 365);
   const months = Math.floor((days % 365) / 30);
   return `${years} an${years > 1 ? 's' : ''} ${months > 0 ? months + ' mois' : ''}`;
+}
+
+/**
+ * Construit les champs d'embed listant l'historique complet des +REP
+ * d'un vendeur (les plus récents en premier), numérotés selon leur
+ * position réelle dans le tableau (utilisée par +suprep pour la suppression).
+ * Découpe en plusieurs champs de ~1000 caractères pour respecter les
+ * limites de Discord, avec un plafond raisonnable de vendeurs très notés.
+ */
+function buildRepHistoryFields(reps) {
+  if (reps.length === 0) {
+    return [{ name: '📝 Historique des +REP', value: '*Aucun +REP pour le moment*', inline: false }];
+  }
+
+  const MAX_SHOWN = 40; // au-delà, on tronque pour rester dans les limites Discord
+  const indexed = reps.map((r, i) => ({ ...r, num: i + 1 }));
+  const newestFirst = [...indexed].reverse().slice(0, MAX_SHOWN);
+
+  const lines = newestFirst.map((r) => {
+    const ts = Math.floor(new Date(r.at).getTime() / 1000);
+    return `**#${r.num}** — <@${r.by}> · <t:${ts}:R>\n> ${r.comment}`;
+  });
+
+  // Découpage en chunks de ~1000 caractères
+  const fields = [];
+  let chunk = '';
+  let part = 1;
+  for (const line of lines) {
+    if ((chunk + '\n' + line).length > 1000) {
+      fields.push({ name: `📝 Historique des +REP (partie ${part})`, value: chunk.trim(), inline: false });
+      chunk = '';
+      part++;
+    }
+    chunk += line + '\n';
+  }
+  if (chunk.trim()) {
+    fields.push({ name: fields.length > 0 ? `📝 Historique des +REP (partie ${part})` : '📝 Historique des +REP', value: chunk.trim(), inline: false });
+  }
+
+  if (reps.length > MAX_SHOWN) {
+    fields.push({ name: '\u200b', value: `*+ ${reps.length - MAX_SHOWN} avis plus anciens non affichés (limite d'affichage Discord)*`, inline: false });
+  }
+
+  return fields.slice(0, 20); // sécurité : max 20 champs pour cette section
 }
 
 /**
@@ -728,9 +783,16 @@ const commands = {
           ].join('\n'), inline: false },
         { name: '🛒 Réputation vendeurs (+REP)', value: [
             '`+rep @vendeur <commentaire>` · Note un vendeur après une transaction',
-            '`+infos @vendeur` · Fiche complète d\'un vendeur (total, historique, dernier +REP)',
+            '`+infos @vendeur` · Fiche complète (historique numéroté de tous les avis)',
+            '`+suprep @vendeur [numéro]` · Supprime un avis (le tien, ou tout admin)',
+            '`+toprep` · Leaderboard des vendeurs les mieux notés',
             '`!rep-reset @user` 🔒 · Réinitialise les +REP d\'un utilisateur',
             '> Un vendeur ne peut pas se +REP lui-même.',
+          ].join('\n'), inline: false },
+        { name: '📹 Surveillance vidéo TikTok', value: [
+            '`!set-video-watch <pseudo_tiktok> <#channel>` 🔒 · Configure la surveillance',
+            '`!video-watch-status` · Affiche la config actuelle',
+            '`!video-watch-disable` 🔒 · Désactive la surveillance',
           ].join('\n'), inline: false },
       )
       .setFooter({ text: '!aide2 → Rating ELO · !aide3 → Tournoi · !aide4 → Modération · !aide5 → Tickets, RR & Vérif' })
@@ -2453,6 +2515,54 @@ const commands = {
     }
   },
 
+  // ── SURVEILLANCE NOUVELLES VIDÉOS TIKTOK ──────────────────────
+  '!set-video-watch': async (message, args) => {
+    if (!isAdmin(message.author.id)) return message.reply('Permission refusée.');
+
+    const channelMention = message.mentions.channels.first();
+    if (args.length < 2 || !channelMention) {
+      return message.reply('Usage : `!set-video-watch <pseudo_tiktok> <#channel>`\nEx : `!set-video-watch crousgainz #nouvelles-videos`');
+    }
+
+    const username = args[0].replace(/^@/, '').trim();
+
+    videoWatch.username         = username;
+    videoWatch.discordChannelId = channelMention.id;
+    videoWatch.enabled          = true;
+    videoWatch.lastVideoId      = null; // sera initialisé au prochain check, sans notif
+    saveVideoWatch();
+
+    await message.reply({
+      embeds: [embed('#00C851')
+        .setTitle('🎬 Surveillance vidéo TikTok configurée')
+        .addFields(
+          { name: 'Compte surveillé', value: `@${username}`,               inline: true },
+          { name: 'Salon de post',    value: `<#${channelMention.id}>`,    inline: true },
+        )
+        .setDescription('La première vidéo détectée servira uniquement de référence (pas de notification), les suivantes seront annoncées.')
+        .setFooter({ text: `Configuré par ${message.author.tag}` })],
+    });
+  },
+
+  '!video-watch-status': async (message) => {
+    const e = embed(videoWatch.enabled ? '#00C851' : '#95A5A6')
+      .setTitle('🎬 Statut de la surveillance vidéo')
+      .addFields(
+        { name: 'Actif',            value: videoWatch.enabled ? '✅ Oui' : '❌ Non',                                   inline: true },
+        { name: 'Compte surveillé', value: videoWatch.username ? `@${videoWatch.username}` : '*non défini*',          inline: true },
+        { name: 'Salon de post',    value: videoWatch.discordChannelId ? `<#${videoWatch.discordChannelId}>` : '*non défini*', inline: true },
+        { name: 'Dernière vidéo connue', value: videoWatch.lastVideoId ? `\`${videoWatch.lastVideoId}\`` : '*aucune*', inline: false },
+      );
+    await message.reply({ embeds: [e] });
+  },
+
+  '!video-watch-disable': async (message) => {
+    if (!isAdmin(message.author.id)) return message.reply('Permission refusée.');
+    videoWatch.enabled = false;
+    saveVideoWatch();
+    await message.reply({ embeds: [embed('#FFA500').setTitle('🎬 Surveillance vidéo désactivée')] });
+  },
+
   // ── STATS @user ───────────────────────────────────────────────
   '!stats': async (message) => {
     const target = message.mentions.members.first() || message.member;
@@ -3324,20 +3434,106 @@ client.on('messageCreate', async (message) => {
     let member = null;
     try { member = await message.guild.members.fetch(target.id); } catch { /* membre parti */ }
 
+    const infoEmbed = new EmbedBuilder()
+      .setColor('#5865F2')
+      .setTitle(`📋 Fiche vendeur — ${target.tag}`)
+      .setThumbnail(target.displayAvatarURL({ size: 256 }))
+      .addFields(
+        { name: '👤 Pseudo',        value: member?.nickname ? `${target.tag} (\`${member.nickname}\`)` : target.tag, inline: false },
+        { name: '⭐ Total +REP',     value: `${total}`,      inline: true },
+        { name: '🕒 Dernier +REP',  value: lastRepStr,       inline: true },
+        { name: '👥 Qui l\'a +REP', value: giversStr,        inline: false },
+      );
+
+    // Historique complet, numéroté (utilisé par +suprep pour choisir quel avis retirer)
+    for (const field of buildRepHistoryFields(reps)) {
+      infoEmbed.addFields(field);
+    }
+
+    infoEmbed.setFooter({ text: `ID : ${target.id} · Utilise +suprep @user <numéro> pour retirer un avis` }).setTimestamp();
+
+    await message.reply({ embeds: [infoEmbed] });
+    return;
+  }
+
+  if (lowerFirstWord === '+suprep') {
+    const target = message.mentions.users.first();
+    if (!target) {
+      return message.reply('Mentionne le vendeur concerné : `+suprep @vendeur <numéro>` (utilise `+infos @vendeur` pour voir les numéros).');
+    }
+
+    const reps = repData[target.id]?.reps || [];
+    if (reps.length === 0) {
+      return message.reply(`<@${target.id}> n'a aucun +REP pour le moment.`);
+    }
+
+    // Numéro de l'avis = dernier nombre présent dans le message
+    const numMatch = trimmedContent.match(/(\d+)(?!.*\d)/);
+    if (!numMatch) {
+      // Pas de numéro fourni -> on affiche la liste numérotée pour aider au choix
+      const listEmbed = new EmbedBuilder()
+        .setColor('#5865F2')
+        .setTitle(`📝 +REP de ${target.tag} — choisis un numéro à supprimer`)
+        .setFooter({ text: `Puis : +suprep @${target.username} <numéro>` });
+      for (const field of buildRepHistoryFields(reps)) listEmbed.addFields(field);
+      return message.reply({ embeds: [listEmbed] });
+    }
+
+    const idx = parseInt(numMatch[1], 10) - 1;
+    if (idx < 0 || idx >= reps.length) {
+      return message.reply(`Numéro invalide. <@${target.id}> a ${reps.length} +REP (numéros 1 à ${reps.length}).`);
+    }
+
+    const repToRemove = reps[idx];
+    const isOwner = repToRemove.by === message.author.id;
+    if (!isAdmin(message.author.id) && !isOwner) {
+      return message.reply('❌ Tu ne peux supprimer que les +REP que **toi-même** as laissés (ou être admin).');
+    }
+
+    reps.splice(idx, 1);
+    saveRepData();
+
     await message.reply({
       embeds: [new EmbedBuilder()
-        .setColor('#5865F2')
-        .setTitle(`📋 Fiche vendeur — ${target.tag}`)
-        .setThumbnail(target.displayAvatarURL({ size: 256 }))
+        .setColor('#FFA500')
+        .setTitle('🗑️ +REP supprimé')
         .addFields(
-          { name: '👤 Pseudo',        value: member?.nickname ? `${target.tag} (\`${member.nickname}\`)` : target.tag, inline: false },
-          { name: '⭐ Total +REP',     value: `${total}`,      inline: true },
-          { name: '🕒 Dernier +REP',  value: lastRepStr,       inline: true },
-          { name: '👥 Qui l\'a +REP', value: giversStr,        inline: false },
+          { name: 'Vendeur',    value: `<@${target.id}>`,                      inline: true },
+          { name: 'Laissé par', value: `<@${repToRemove.by}>`,                 inline: true },
+          { name: 'Commentaire supprimé', value: repToRemove.comment,          inline: false },
+          { name: 'Total restant', value: `${reps.length}`,                    inline: true },
         )
-        .setFooter({ text: `ID : ${target.id}` })
-        .setTimestamp()],
+        .setFooter({ text: `Supprimé par ${message.author.tag}` })],
     });
+    return;
+  }
+
+  if (lowerFirstWord === '+toprep') {
+    const entries = Object.entries(repData)
+      .map(([id, data]) => ({ id, count: data.reps.length }))
+      .filter(e => e.count > 0)
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 15);
+
+    if (entries.length === 0) {
+      return message.reply('Aucun +REP n\'a encore été distribué sur ce serveur.');
+    }
+
+    const medals = ['🥇', '🥈', '🥉'];
+    const lines = await Promise.all(entries.map(async (e, i) => {
+      const rank = medals[i] || `**#${i + 1}**`;
+      let tag = `<@${e.id}>`;
+      return `${rank} ${tag} — **${e.count}** +REP`;
+    }));
+
+    const leaderboardEmbed = new EmbedBuilder()
+      .setColor('#FFD700')
+      .setTitle('🏆 Leaderboard +REP — Vendeurs les mieux notés')
+      .setDescription(lines.join('\n'))
+      .setFooter({ text: `${entries.length} vendeur(s) classé(s) · +infos @user pour le détail` })
+      .setTimestamp();
+
+    await message.reply({ embeds: [leaderboardEmbed] });
     return;
   }
 
@@ -3700,6 +3896,67 @@ async function checkTikTokLive() {
 }
 
 // ============================================================
+//  TIKTOK NOUVELLE VIDÉO CHECKER
+// ============================================================
+
+async function checkTikTokNewVideo() {
+  if (!videoWatch.enabled || !videoWatch.username || !videoWatch.discordChannelId) return;
+
+  try {
+    const headers = {
+      'User-Agent':      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      'Accept':          'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7',
+      'Accept-Encoding': 'gzip, deflate, br',
+      'Cache-Control':   'no-cache',
+      'Pragma':          'no-cache',
+      'Sec-Fetch-Mode':  'navigate',
+    };
+    const response = await axios.get(`https://www.tiktok.com/@${videoWatch.username}`, { headers, timeout: 15000, maxRedirects: 5 });
+    const html     = response.data;
+
+    // Les vidéos les plus récentes apparaissent en premier dans le HTML du profil.
+    const idMatches = [...html.matchAll(/\/video\/(\d{15,20})/g)].map(m => m[1]);
+    if (idMatches.length === 0) {
+      console.warn('[VIDEO] Aucune vidéo trouvée sur le profil (page peut-être bloquée).');
+      return;
+    }
+    const latestId = idMatches[0];
+
+    console.log(`[VIDEO CHECK] @${videoWatch.username} -- dernière vidéo détectée : ${latestId}`);
+
+    if (videoWatch.lastVideoId === null) {
+      // Premier check : on initialise sans notifier pour ne pas spam avec l'historique.
+      videoWatch.lastVideoId = latestId;
+      saveVideoWatch();
+      return;
+    }
+
+    if (latestId !== videoWatch.lastVideoId) {
+      videoWatch.lastVideoId = latestId;
+      saveVideoWatch();
+
+      const channel = client.channels.cache.get(videoWatch.discordChannelId);
+      if (!channel) { console.error(`[VIDEO] Channel ${videoWatch.discordChannelId} introuvable.`); return; }
+
+      const videoUrl = `https://www.tiktok.com/@${videoWatch.username}/video/${latestId}`;
+      await channel.send({
+        content: `📹 **@${videoWatch.username}** vient de poster une nouvelle vidéo !`,
+        embeds: [embed('#FF0050')
+          .setTitle('Nouvelle vidéo TikTok')
+          .setDescription(`**@${videoWatch.username}** a publié une nouvelle vidéo.\n\n[▶️ Voir la vidéo](${videoUrl})`)
+          .setThumbnail(`https://unavatar.io/tiktok/${videoWatch.username}`)
+          .setFooter({ text: `Détecté à ${new Date().toLocaleTimeString('fr-FR')}` })],
+      });
+    }
+  } catch (err) {
+    if (err.response?.status === 429) { console.warn('[VIDEO] Rate limit TikTok.'); }
+    else if (err.response?.status === 404) { console.warn('[VIDEO] Profil TikTok introuvable.'); }
+    else { console.error('[VIDEO] Erreur :', err.message); }
+  }
+}
+
+// ============================================================
 //  RESTAURATION DES TIMERS AU DÉMARRAGE
 // ============================================================
 
@@ -3909,10 +4166,13 @@ client.once('ready', async () => {
   console.log(`[VERIF] Système: ${verifConfig.enabled ? 'ACTIVÉ' : 'DÉSACTIVÉ'}`);
   console.log(`[VERIF] Blacklist: ${Object.keys(blacklistData).length} entrée(s)`);
   console.log(`[VERIF] En attente: ${Object.keys(pendingVerifs).length} demande(s)`);
+  console.log(`[VIDEO] Surveillance: ${videoWatch.enabled ? `@${videoWatch.username} -> #${videoWatch.discordChannelId}` : 'DÉSACTIVÉE'}`);
 
   await restoreTimers();
   checkTikTokLive();
   setInterval(checkTikTokLive, CONFIG.LIVE_CHECK_INTERVAL);
+  checkTikTokNewVideo();
+  setInterval(checkTikTokNewVideo, CONFIG.VIDEO_CHECK_INTERVAL || 5 * 60 * 1000);
 });
 
 client.on('error', (err) => console.error('[Discord] Erreur client:', err));
